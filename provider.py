@@ -1,104 +1,122 @@
+import boto3
+from botocore.exceptions import ClientError
+
 import logging
-import os
-import platform
-import subprocess
-import time
 
 from virtual_env.providers.base import Provider
 
-logger = logging.getLogger("desktopenv.providers.vmware.VMwareProvider")
+logger = logging.getLogger("desktopenv.providers.aws.AWSProvider")
 logger.setLevel(logging.INFO)
 
-WAIT_TIME = 3
+WAIT_DELAY = 15
+MAX_ATTEMPTS = 10
 
 
-def get_vmrun_type(return_list=False):
-    if platform.system() == 'Windows' or platform.system() == 'Linux':
-        if return_list:
-            return ['-T', 'ws']
-        else:
-            return '-T ws'
-    elif platform.system() == 'Darwin':  # Darwin is the system name for macOS
-        if return_list:
-            return ['-T', 'fusion']
-        else:
-            return '-T fusion'
-    else:
-        raise Exception("Unsupported operating system")
+class AWSProvider(Provider):
 
+    def start_emulator(self, path_to_vm: str, headless: bool):
+        logger.info("Starting AWS VM...")
+        ec2_client = boto3.client('ec2', region_name=self.region)
 
-class VMwareProvider(Provider):
-    @staticmethod
-    def _execute_command(command: list, return_output=False):
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8"
-        )
+        try:
+            # Start the instance
+            ec2_client.start_instances(InstanceIds=[path_to_vm])
+            logger.info(f"Instance {path_to_vm} is starting...")
 
-        if return_output:
-            output = process.communicate()[0].strip()
-            return output
-        else:
-            return None
+            # Wait for the instance to be in the 'running' state
+            waiter = ec2_client.get_waiter('instance_running')
+            waiter.wait(InstanceIds=[path_to_vm], WaiterConfig={'Delay': WAIT_DELAY, 'MaxAttempts': MAX_ATTEMPTS})
+            logger.info(f"Instance {path_to_vm} is now running.")
 
-    def start_emulator(self, path_to_vm: str, headless: bool, os_type: str):
-        print("Starting VMware VM...")
-        logger.info("Starting VMware VM...")
-
-        while True:
-            try:
-                output = subprocess.check_output(f"vmrun {get_vmrun_type()} list", shell=True, stderr=subprocess.STDOUT)
-                output = output.decode()
-                output = output.splitlines()
-                normalized_path_to_vm = os.path.abspath(os.path.normpath(path_to_vm))
-
-                if any(os.path.abspath(os.path.normpath(line)) == normalized_path_to_vm for line in output):
-                    logger.info("VM is running.")
-                    break
-                else:
-                    logger.info("Starting VM...")
-                    _command = ["vmrun"] + get_vmrun_type(return_list=True) + ["start", path_to_vm]
-                    
-                    if headless:
-                        _command.append("nogui")
-                    VMwareProvider._execute_command(_command)
-                    # time.sleep(WAIT_TIME)
-
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Error executing command: {e.output.decode().strip()}")
+        except ClientError as e:
+            logger.error(f"Failed to start the AWS VM {path_to_vm}: {str(e)}")
+            raise
 
     def get_ip_address(self, path_to_vm: str) -> str:
-        logger.info("Getting VMware VM IP address...")
-        while True:
-            try:
-                output = VMwareProvider._execute_command(
-                    ["vmrun"] + get_vmrun_type(return_list=True) + ["getGuestIPAddress", path_to_vm, "-wait"],
-                    return_output=True
-                )
-                logger.info(f"VMware VM IP address: {output}")
-                return output
-            except Exception as e:
-                logger.error(e)
-                time.sleep(WAIT_TIME)
-                logger.info("Retrying to get VMware VM IP address...")
+        logger.info("Getting AWS VM IP address...")
+        ec2_client = boto3.client('ec2', region_name=self.region)
+
+        try:
+            response = ec2_client.describe_instances(InstanceIds=[path_to_vm])
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    private_ip_address = instance.get('PrivateIpAddress', '')
+                    return private_ip_address
+            return ''  # Return an empty string if no IP address is found
+        except ClientError as e:
+            logger.error(f"Failed to retrieve private IP address for the instance {path_to_vm}: {str(e)}")
+            raise
 
     def save_state(self, path_to_vm: str, snapshot_name: str):
-        logger.info("Saving VMware VM state...")
-        VMwareProvider._execute_command(
-            ["vmrun"] + get_vmrun_type(return_list=True) + ["snapshot", path_to_vm, snapshot_name])
-        time.sleep(WAIT_TIME)  # Wait for the VM to save
+        logger.info("Saving AWS VM state...")
+        ec2_client = boto3.client('ec2', region_name=self.region)
+
+        try:
+            image_response = ec2_client.create_image(InstanceId=path_to_vm, ImageId=snapshot_name)
+            image_id = image_response['ImageId']
+            logger.info(f"AMI {image_id} created successfully from instance {path_to_vm}.")
+            return image_id
+        except ClientError as e:
+            logger.error(f"Failed to create AMI from the instance {path_to_vm}: {str(e)}")
+            raise
 
     def revert_to_snapshot(self, path_to_vm: str, snapshot_name: str):
-        logger.info(f"Reverting VMware VM to snapshot: {snapshot_name}...")
-        VMwareProvider._execute_command(
-            ["vmrun"] + get_vmrun_type(return_list=True) + ["revertToSnapshot", path_to_vm, snapshot_name])
-        time.sleep(WAIT_TIME)  # Wait for the VM to revert
-        return path_to_vm
+        logger.info(f"Reverting AWS VM to snapshot: {snapshot_name}...")
+        ec2_client = boto3.client('ec2', region_name=self.region)
 
-    def stop_emulator(self, path_to_vm: str):
-        logger.info("Stopping VMware VM...")
-        VMwareProvider._execute_command(["vmrun"] + get_vmrun_type(return_list=True) + ["stop", path_to_vm])
-        time.sleep(WAIT_TIME)  # Wait for the VM to stop
+        try:
+            # Step 1: Retrieve the original instance details
+            instance_details = ec2_client.describe_instances(InstanceIds=[path_to_vm])
+            instance = instance_details['Reservations'][0]['Instances'][0]
+            security_groups = [sg['GroupId'] for sg in instance['SecurityGroups']]
+            subnet_id = instance['SubnetId']
+            instance_type = instance['InstanceType']
+
+            # Step 2: Terminate the old instance
+            ec2_client.terminate_instances(InstanceIds=[path_to_vm])
+            logger.info(f"Old instance {path_to_vm} has been terminated.")
+
+            # Step 3: Launch a new instance from the snapshot
+            logger.info(f"Launching a new instance from snapshot {snapshot_name}...")
+
+            run_instances_params = {
+                "MaxCount": 1,
+                "MinCount": 1,
+                "ImageId": snapshot_name,
+                "InstanceType": instance_type,
+                "EbsOptimized": True,
+                "NetworkInterfaces": [
+                    {
+                        "SubnetId": subnet_id,
+                        "AssociatePublicIpAddress": True,
+                        "DeviceIndex": 0,
+                        "Groups": security_groups
+                    }
+                ]
+            }
+
+            new_instance = ec2_client.run_instances(**run_instances_params)
+            new_instance_id = new_instance['Instances'][0]['InstanceId']
+            logger.info(f"New instance {new_instance_id} launched from snapshot {snapshot_name}.")
+            logger.info(f"Waiting for instance {new_instance_id} to be running...")
+            ec2_client.get_waiter('instance_running').wait(InstanceIds=[new_instance_id])
+            logger.info(f"Instance {new_instance_id} is ready.")
+
+            return new_instance_id
+
+        except ClientError as e:
+            logger.error(f"Failed to revert to snapshot {snapshot_name} for the instance {path_to_vm}: {str(e)}")
+            raise
+
+    def stop_emulator(self, path_to_vm, region=None):
+        logger.info(f"Stopping AWS VM {path_to_vm}...")
+        ec2_client = boto3.client('ec2', region_name=self.region)
+
+        try:
+            ec2_client.stop_instances(InstanceIds=[path_to_vm])
+            waiter = ec2_client.get_waiter('instance_stopped')
+            waiter.wait(InstanceIds=[path_to_vm], WaiterConfig={'Delay': WAIT_DELAY, 'MaxAttempts': MAX_ATTEMPTS})
+            logger.info(f"Instance {path_to_vm} has been stopped.")
+        except ClientError as e:
+            logger.error(f"Failed to stop the AWS VM {path_to_vm}: {str(e)}")
+            raise
